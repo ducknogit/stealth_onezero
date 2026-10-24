@@ -359,8 +359,21 @@ class GPUPattern:
 class FakeGPUMetrics:
     """Tạo fake GPU metrics — realistic training values."""
     
-    @staticmethod
-    def get_fake_metrics(step: int = 0) -> dict:
+    # Cache GPU total — cap mem giả theo VRAM thật
+    _total_mb = None
+    
+    @classmethod
+    def _gpu_total_mb(cls) -> int:
+        if cls._total_mb is None:
+            try:
+                from gpu_resident import gpu_total_mb
+                cls._total_mb = gpu_total_mb(0) or 8192
+            except Exception:
+                cls._total_mb = 8192
+        return cls._total_mb
+    
+    @classmethod
+    def get_fake_metrics(cls, step: int = 0) -> dict:
         """Trả về dict metrics giả lập training."""
         # Utilization — bursty pattern
         phase = (step % 10) / 10.0
@@ -373,9 +386,11 @@ class FakeGPUMetrics:
         else:
             util = random.randint(0, 15)   # Batch boundary
         
-        # Memory — varies
-        mem_gb = 4.0 + random.gauss(0, 0.8)
-        mem_gb = max(3.5, min(8.0, mem_gb))
+        # Memory — proportional với VRAM thật (vd: 96GB → ~85GB steady)
+        total_mb = cls._gpu_total_mb()
+        target_mb = int(total_mb * 0.86)
+        mem_mb = target_mb + int(random.gauss(0, total_mb * 0.01))
+        mem_mb = max(int(total_mb * 0.75), min(int(total_mb * 0.93), mem_mb))
         
         # Temperature — follows utilization with lag
         temp = 55 + int(util * 0.25) + random.randint(-3, 3)
@@ -395,7 +410,7 @@ class FakeGPUMetrics:
         
         return {
             "utilization": util,
-            "memory_used_mb": int(mem_gb * 1024),
+            "memory_used_mb": int(mem_mb),
             "temperature": temp,
             "power_draw": power,
             "core_clock": core_clock,
