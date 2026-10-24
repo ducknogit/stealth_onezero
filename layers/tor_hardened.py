@@ -37,10 +37,26 @@ from typing import Optional, List, Tuple, Dict
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-TOR_BUNDLE_URL = (
-    "https://dist.torproject.org/torbrowser/15.0.25/"
-    "tor-expert-bundle-linux-x86_64-15.0.25.tar.gz"
-)
+TOR_BUNDLE_URLS = {
+    # arch → expert bundle URL
+    "x86_64": (
+        "https://dist.torproject.org/torbrowser/15.0.25/"
+        "tor-expert-bundle-linux-x86_64-15.0.25.tar.gz"
+    ),
+    "amd64": (
+        "https://dist.torproject.org/torbrowser/15.0.25/"
+        "tor-expert-bundle-linux-x86_64-15.0.25.tar.gz"
+    ),
+    "aarch64": (
+        "https://dist.torproject.org/torbrowser/15.0.25/"
+        "tor-expert-bundle-linux-aarch64-15.0.25.tar.gz"
+    ),
+    "arm64": (
+        "https://dist.torproject.org/torbrowser/15.0.25/"
+        "tor-expert-bundle-linux-aarch64-15.0.25.tar.gz"
+    ),
+}
+TOR_BUNDLE_URL = TOR_BUNDLE_URLS["x86_64"]
 MOAT_BUILTIN = "https://bridges.torproject.org/moat/circumvention/builtin"
 
 # Hardcoded fallback (public builtin bridges, có thể rotate)
@@ -111,18 +127,55 @@ def dedupe_bridges(bridges: List[str]) -> List[str]:
 # TOR EXPERT BUNDLE — download/extract, tìm tor + lyrebird
 # ═══════════════════════════════════════════════════════════════
 
+def _elf_info(path: str):
+    """
+    Đọc ELF header — trả về ("elf", arch) | ("not-elf", None) | ("unknown", None).
+    Dùng để: (1) tránh lấy nhầm file text/debug, (2) detect arch mismatch.
+    """
+    try:
+        with open(path, "rb") as f:
+            h = f.read(20)
+        if len(h) < 20:
+            return ("not-elf", None)
+        if h[:4] != b"\x7fELF":
+            return ("not-elf", None)
+        machine = int.from_bytes(h[18:20], "little")
+        arch = {0x3E: "x86_64", 0xB7: "aarch64", 0x03: "i386"}.get(machine, hex(machine))
+        return ("elf", arch)
+    except Exception:
+        return ("unknown", None)
+
+
+def safe_extractall(t: tarfile.TarFile, path: str):
+    """extractall có filter='data' nếu Python >=3.12, ngược lại thường."""
+    try:
+        t.extractall(path, filter="data")
+    except TypeError:
+        t.extractall(path)
+
+
+def host_arch() -> str:
+    import platform
+    a = platform.machine().lower()
+    return {"amd64": "x86_64", "arm64": "aarch64"}.get(a, a)
+
+
+def bundle_url() -> str:
+    return TOR_BUNDLE_URLS.get(host_arch(), TOR_BUNDLE_URLS["x86_64"])
+
+
 def ensure_bundle(dest: Optional[str] = None,
-                  url: str = TOR_BUNDLE_URL) -> Optional[str]:
+                  url: Optional[str] = None) -> Optional[str]:
     """
     Download + extract tor-expert-bundle. Trả về root dir hoặc None.
     Expert bundle đã gồm: tor, lyrebird (obfs4+snowflake+webtunnel), geoip.
+    Chọn bundle URL theo arch host (x86_64/aarch64).
     """
     base = dest or os.path.join(tempfile.gettempdir(), ".torx")
-    if os.path.isfile(os.path.join(base, "tor", "tor")):
-        return base
     if find_tool(base, "tor"):
         return base
 
+    url = url or bundle_url()
     os.makedirs(base, exist_ok=True)
     tarball = os.path.join(base, "bundle.tgz")
     try:
@@ -132,18 +185,18 @@ def ensure_bundle(dest: Optional[str] = None,
 
     try:
         with tarfile.open(tarball, "r:gz") as t:
-            t.extractall(base, filter="data")
+            safe_extractall(t, base)
         os.unlink(tarball)
     except Exception:
         return None
 
-    # Bundle layout: tor/tor, tor/lyrebird hoặc tor/pluggable_transports/lyrebird
+    # chmod mọi executable candidate
     for root, dirs, files in os.walk(base):
         for f in files:
-            if f in ("tor", "lyrebird"):
+            if f in ("tor", "lyrebird", "conjure-client"):
                 p = os.path.join(root, f)
                 try:
-                    os.chmod(p, 0o700)
+                    os.chmod(p, 0o755)
                 except Exception:
                     pass
 
@@ -151,17 +204,57 @@ def ensure_bundle(dest: Optional[str] = None,
 
 
 def find_tool(root: str, name: str) -> Optional[str]:
-    """Tìm binary theo tên trong root tree."""
+    """
+    Tìm binary theo tên, có validate:
+    1. Ưu tiên bản release (tor/tor) — BỎ qua debug/tor
+    2. Phải là ELF đúng (không phải file text/empty)
+    3. Ưu tiên ELF khớp arch host — nếu arch mismatch, vẫn trả về
+       (để caller log rõ), nhưng ưu tiên khớp.
+    Trả về đường dẫn hoặc None.
+    """
+    if not os.path.isdir(root):
+        return None
+
+    candidates = []
     for r, d, files in os.walk(root):
         if name in files:
             p = os.path.join(r, name)
             if os.path.isfile(p):
-                try:
-                    os.chmod(p, 0o700)
-                except Exception:
-                    pass
-                return p
-    return None
+                candidates.append(p)
+
+    if not candidates:
+        return None
+
+    # Phân loại
+    host = host_arch()
+    scored = []
+    for p in candidates:
+        kind, arch = _elf_info(p)
+        if kind != "elf":
+            score = -100           # file text/rỗng → loại
+        elif arch == host:
+            score = 10             # ELF khớp arch
+        else:
+            score = 1              # ELF khác arch (mang đi log)
+        # Ưu tiên không nằm trong debug/
+        if os.sep + "debug" + os.sep in p:
+            score -= 5
+        # Ưu tiên path chuẩn tor/<name>
+        if os.path.basename(os.path.dirname(p)) in ("tor", "pluggable_transports"):
+            score += 3
+        scored.append((score, p, arch))
+
+    scored.sort(key=lambda x: -x[0])
+    best_score, best_path, best_arch = scored[0]
+
+    if best_score < 0:
+        return None
+
+    try:
+        os.chmod(best_path, 0o755)
+    except Exception:
+        pass
+    return best_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -286,7 +379,16 @@ def start_tor_hardened(socks: Tuple[str, int] = ("127.0.0.1", 9050),
         log("[torx] tor binary not found")
         return None
 
-    log(f"[torx] tor={tor_bin} lyrebird={lyrebird}")
+    # Diagnostic: arch + ELF header — Exec format error thường do arch mismatch
+    kind, arch = _elf_info(tor_bin)
+    log(f"[torx] arch host={host_arch()} tor_elf={kind}/{arch} "
+        f"bin={tor_bin} lyrebird={lyrebird}")
+    if kind == "elf" and arch != host_arch():
+        log(f"[torx] ARCH MISMATCH: bundle {arch} vs host {host_arch()} "
+            f"— cần bundle {host_arch()}")
+        return None
+    if kind != "elf":
+        log(f"[torx] tor binary không phải ELF ({kind}) — bundle hỏng?")
 
     # 2. Bridges
     bridges = fetch_builtin_bridges()

