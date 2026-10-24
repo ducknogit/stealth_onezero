@@ -1,0 +1,31 @@
+# Binary
+bin/onezerominer
+bin/*.tar.gz
+*.bin
+
+# Keep bin/README.md
+!bin/README.md
+
+# Tor data
+.tor-miner/
+stealth-miner/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
